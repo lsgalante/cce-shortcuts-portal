@@ -1,0 +1,8 @@
+# Bus activation for the GlobalShortcuts portal backend: xdg-desktop-portal
+# calls this name the first time an app asks for a global shortcut, and the
+# bus starts the backend. Exec must be absolute (D-Bus expands nothing), so
+# this names the ccebuild install location the way cce.portal's file chooser
+# does.
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.cce-shortcuts
+Exec=/home/lsgalante/.local/bin/cce-shortcuts-portal
