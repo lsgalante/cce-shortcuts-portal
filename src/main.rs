@@ -17,6 +17,7 @@
 //! A fresh one begins with `shortcut clear`, so binds left by a predecessor
 //! that died can never keep eating chords nobody is listening for.
 
+use cce_core::ipc::ctl::{self, Request, ShortcutRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -73,31 +74,22 @@ type SharedState = Arc<Mutex<Shared>>;
 
 // ── compositor sockets ─────────────────────────────────────────────────────
 
-fn display() -> Option<String> {
-    std::env::var("WAYLAND_DISPLAY").ok().filter(|d| !d.is_empty())
-}
-
 /// The control socket, as `ccectl` resolves it.
 fn ctl_socket_path() -> String {
-    match display() {
-        Some(d) => format!("/tmp/cce-{d}.sock"),
-        None => "/tmp/cce.sock".to_string(),
-    }
+    ctl::control_socket()
 }
 
-/// The status socket (`status_server::get_status_socket_path`).
+/// The status socket.
 fn status_socket_path() -> String {
-    match display() {
-        Some(d) => format!("/tmp/cce-status-interface-{d}.sock"),
-        None => "/tmp/cce-status-interface.sock".to_string(),
-    }
+    ctl::status_socket()
 }
 
 /// One request/reply round on the control socket. The compositor answers
-/// one line and closes, so the reply is everything up to EOF.
-async fn ctl(cmd: &str) -> std::io::Result<String> {
+/// one line and closes, so the reply is everything up to EOF. The line is
+/// cce-core's `ctl::Request`, the grammar the compositor parses.
+async fn ctl(req: &Request) -> std::io::Result<String> {
     let mut stream = tokio::net::UnixStream::connect(ctl_socket_path()).await?;
-    stream.write_all(format!("{cmd}\n").as_bytes()).await?;
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply).await?;
     Ok(reply)
@@ -210,8 +202,12 @@ impl Backend {
                 log::warn!("{}: shortcut {:?} has no preferred_trigger; not bound", session, id);
                 continue;
             };
-            let cmd = format!("shortcut bind {} {} {}", session, encode_token(&id), encode_token(&trigger));
-            match ctl(&cmd).await {
+            let bind = ShortcutRequest::Bind {
+                session: session.to_string(),
+                id: encode_token(&id),
+                trigger: encode_token(&trigger),
+            };
+            match ctl(&Request::Shortcut(bind)).await {
                 Ok(reply) if reply.starts_with("ok") => {
                     let trigger_description = reply[2..].trim().to_string();
                     log::info!("{}: bound {:?} to {}", session, id, trigger_description);
@@ -284,7 +280,8 @@ impl SessionObj {
 
     async fn close(&self, #[zbus(connection)] conn: &Connection) {
         log::info!("Close {}", self.path);
-        if let Err(e) = ctl(&format!("shortcut unbind {}", self.path)).await {
+        let unbind = ShortcutRequest::Unbind { session: self.path.to_string(), id: None };
+        if let Err(e) = ctl(&Request::Shortcut(unbind)).await {
             log::warn!("control socket {}: {}", ctl_socket_path(), e);
         }
         self.shared.lock().await.sessions.remove(&self.path);
@@ -321,7 +318,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // taking the bus name. This also proves the compositor speaks the
     // command at all: an older one answers `error: unknown command`, and
     // then this backend must not claim to serve anything.
-    let reply = ctl("shortcut clear")
+    let reply = ctl(&Request::Shortcut(ShortcutRequest::Clear))
         .await
         .map_err(|e| format!("control socket {}: {e}", ctl_socket_path()))?;
     if !reply.starts_with("ok") {
@@ -334,7 +331,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("status socket {}: {e}", status_socket_path()))?;
     let (reader, mut writer) = status.into_split();
-    writer.write_all(b"shortcuts\n").await?;
+    writer.write_all(format!("{}\n", ctl::StatusTopic::Shortcuts).as_bytes()).await?;
 
     let shared: SharedState = Arc::new(Mutex::new(Shared::default()));
     let conn = zbus::connection::Builder::session()?
@@ -347,24 +344,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let emitter = SignalEmitter::new(&conn, OBJ_PATH)?;
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        let mut it = line.split_whitespace();
-        let (Some(kind), Some(session), Some(id)) = (it.next(), it.next(), it.next()) else {
+        let Some(event) = ctl::ShortcutEvent::parse(&line) else {
             log::warn!("unparseable status line {:?}", line);
             continue;
         };
-        let timestamp: u64 = it.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        let session = event.session.as_str();
+        let timestamp = u64::from(event.time_msec);
         let Ok(path) = ObjectPath::try_from(session) else {
             log::warn!("bad session path in {:?}", line);
             continue;
         };
-        let id = decode_token(id);
-        let result = match kind {
-            "activated" => Backend::activated(&emitter, path, &id, timestamp, HashMap::new()).await,
-            "deactivated" => Backend::deactivated(&emitter, path, &id, timestamp, HashMap::new()).await,
-            other => {
-                log::warn!("unknown shortcut event {:?}", other);
-                Ok(())
-            }
+        let id = decode_token(&event.id);
+        let kind = if event.activated { "activated" } else { "deactivated" };
+        let result = if event.activated {
+            Backend::activated(&emitter, path, &id, timestamp, HashMap::new()).await
+        } else {
+            Backend::deactivated(&emitter, path, &id, timestamp, HashMap::new()).await
         };
         if let Err(e) = result {
             log::warn!("emitting {} for {}: {}", kind, session, e);
