@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 [dependencies]
 # The compositor's socket names, the shortcut request lines and the
 # `shortcuts` topic's event line (ipc::ctl); GUI-free, without the config.
-cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "6333e4da15b5daa241919df1b057c94e52246391", default-features = false }
+cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "459192f05cd81bec4532230f29db643b8c56705b", default-features = false }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
